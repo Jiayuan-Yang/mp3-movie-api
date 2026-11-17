@@ -193,3 +193,88 @@ def test_request_ids_and_error_response(client, storage, monkeypatch):
 def test_invalid_processing_body(client, sample, body):
     upload(client, sample)
     assert client.post('/movies/process', json=body).status_code == 422
+
+
+def test_movies_persist(client, test_storage, uploaded_movies, sample_csv_bytes):
+    from io import BytesIO
+    reopened = MovieStorage(test_storage.db_path)
+    movies = reopened.get()
+    assert reopened.count_movies() == len(movies) == 20
+    assert list(movies.columns) == MOVIE_COLUMNS
+    assert movies['title'].tolist() == pd.read_csv(BytesIO(sample_csv_bytes))['title'].tolist()
+    records = reopened.select_columns(MOVIE_COLUMNS, 100)
+    assert records == client.get('/movies?limit=100').json()['data']
+    assert [row['id'] for row in records] == list(range(1, 21))
+
+
+def test_cache_and_processing(client, uploaded_movies, processing_body):
+    import main
+    responses = {}
+    for limit in (100, 1):
+        response = client.get('/movies', params={'limit': limit})
+        assert response.status_code == 200
+        responses[limit] = response.json()
+        assert main.cache.get(limit) == response.json()
+    assert client.get('/movies?limit=100').json() == responses[100]
+    response = client.post('/movies/process', json=processing_body)
+    assert response.status_code == 200
+    assert response.json() == {'validation_rows_removed': 0, 'cleaning_report': {
+        'rows_before': 20, 'rows_after': 16, 'rows_removed': 4,
+        'columns_before': 4, 'columns_after': 4, 'columns_removed': 0}}
+    assert main.cache.get(100) is None
+    assert main.cache.get(1) is None
+    result = client.get('/movies?limit=100').json()
+    assert result['total_rows'] == 16
+    assert [row['title'] for row in result['data']] == [f'Movie {c}' for c in 'ABCDEFGHIJKLMNOP']
+    assert [row['id'] for row in result['data']] == list(range(1, 17))
+    assert main.cache.get(100) == result
+
+
+def test_cache_hit_skips_database(client, uploaded_movies, monkeypatch):
+    import main
+    response = client.get('/movies?limit=100')
+    assert response.status_code == 200
+
+    def fail(*args, **kwargs):
+        pytest.fail('Cache hit accessed the database')
+
+    monkeypatch.setattr(main.storage, 'select_columns', fail)
+    monkeypatch.setattr(main.storage, 'count_movies', fail)
+    cached = client.get('/movies?limit=100')
+    assert cached.status_code == 200
+    assert cached.json() == response.json()
+
+
+def test_upload_invalidates_all_limits(client, uploaded_movies, sample_csv_bytes):
+    import main
+    for limit in (1, 100):
+        client.get('/movies', params={'limit': limit})
+    assert upload(client, sample_csv_bytes).status_code == 200
+    assert all(main.cache.get(limit) is None for limit in (1, 100))
+    assert client.get('/movies').json()['total_rows'] == 20
+
+
+def test_failed_writes_preserve_cache(client, uploaded_movies, monkeypatch):
+    import main
+    before = client.get('/movies').json()
+    assert client.post('/movies/process', json={'validation': {'required_columns': ['unknown']}}).status_code == 400
+    assert main.cache.get(100) == before
+
+    def fail(*args):
+        raise sqlite3.OperationalError('Simulated write failure')
+
+    monkeypatch.setattr(main.storage, 'save', fail)
+    assert upload(client, b'title,release_year,rating,genre\nNew,2020,8,Drama\n').status_code == 500
+    assert main.cache.get(100) == before
+
+
+def test_cache_expiry_and_json_roundtrip():
+    from src import MovieCache
+    cache = MovieCache()
+    response = {'data': [{'title': '电影', 'rating': None}], 'total_rows': 1}
+    assert cache.get(100) is None
+    cache.set(100, response)
+    assert cache.get(100) == response
+    assert 0 < cache.client.ttl(cache.make_key(100)) <= 90
+    cache.client.expire(cache.make_key(100), 0)
+    assert cache.get(100) is None

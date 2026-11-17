@@ -5,7 +5,7 @@ import pandas as pd
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 
 from data_pipeline import create_cleaning_report, process_data, validate_dataframe
-from src import MovieStorage, MovieUploadInfo, MovieDataResponse, MovieProcessingReport, ProcessConfig
+from src import MovieCache, MovieStorage, MovieUploadInfo, MovieDataResponse, MovieProcessingReport, ProcessConfig
 from src import HealthResponse, log_requests, setup_logging
 from src.storage import MOVIE_COLUMNS
 from src.utils import parse_movie_csv
@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Movie Collection API", version="1.0.0")
 app.middleware("http")(log_requests)
 storage = MovieStorage(os.environ.get("MOVIE_DB_PATH", "data/movies.db"))
+
+cache = MovieCache()
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -33,16 +35,23 @@ async def upload_movies(file: UploadFile = File(...)):
     finally:
         await file.close()
     storage.save(df)
+    cache.invalidate()
     logger.info("Uploaded movies: filename=%s, rows=%s", file.filename, len(df))
     return MovieUploadInfo(filename=file.filename, rows=len(df), columns=len(df.columns), column_names=list(df.columns))
 
 
 @app.get("/movies", response_model=MovieDataResponse)
 def get_movies(limit: int = Query(default=100, ge=1)):
+    cached = cache.get(limit)
+    if cached is not None:
+        logger.info("Movie cache hit: limit=%s", limit)
+        return cached
     data = storage.select_columns(MOVIE_COLUMNS, limit)
     total = storage.count_movies()
     logger.info("Retrieved movies: rows=%s", len(data))
-    return {"data": data, "total_rows": total}
+    response = {"data": data, "total_rows": total}
+    cache.set(limit, response)
+    return response
 
 
 @app.get("/movies/search", response_model=list[dict])
@@ -75,6 +84,7 @@ def process_movies(config: ProcessConfig):
         report = create_cleaning_report(before, processed)
         # The SQL schema remains fixed even if MP2's pipeline drops a column.
         storage.save(processed.reindex(columns=MOVIE_COLUMNS))
+        cache.invalidate()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     logger.info("Processed movies: validation_rows_removed=%s, cleaning_report=%s", removed, report)
